@@ -1,42 +1,66 @@
 name: Release
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "30 22 * * *"
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Get latest go version
-        id: version
-        run: |
-          echo ::set-output name=go_version::1.19.9
+
       - name: Setup Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: ${{ steps.version.outputs.go_version }}
+          go-version: '1.22' # 建议使用较新的 Go 版本
+
+      # --- 核心修改：新增数据处理步骤 ---
+      - name: Prepare custom rules
+        run: |
+          # 1. 创建数据目录（如果不存在）
+          mkdir -p data
+          
+          # 2. 下载并清洗数据
+          # grep 筛选以 0.0.0.0 开头的行
+          # awk 提取第二列（域名）
+          # 输出到 data/heidai 文件中，这样编译后的 tag 就是 "geosite:heidai"
+          echo "Downloading and processing heidai rules..."
+          curl -sL https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockhosts.txt | \
+          grep "^0.0.0.0" | \
+          awk '{print $2}' > data/heidai
+          
+          # 3. 打印一下行数验证是否成功
+          echo "Extracted $(wc -l < data/heidai) rules to data/heidai"
+
       - name: Build geosite
         id: build
         run: |
+          # 编译命令（sing-geosite 默认会扫描 data 目录并将其打包进 db）
           go run -v .
+
       - name: Generate sha256 hash
         if: steps.build.outputs.skip != 'true'
         run: |
-          mkdir dist
+          mkdir -p dist
           cp geosite.db dist/
           sha256sum geosite.db > dist/geosite.db.sha256sum
+
       - name: Push artifacts to release branch
         if: steps.build.outputs.skip != 'true'
         run: |
-          git config --local user.email "891708+soffchen@users.noreply.github.com"
-          git config --local user.name "github-action[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git fetch
-          git checkout release
+          
+          # 切换到 release 分支，如果不存在则处理
+          git checkout release || git checkout -b release
+          # 使用 orphan 分支清理历史（保持原逻辑）
           git checkout --orphan release-orphan
           git rm -rf .
           
@@ -45,20 +69,27 @@ jobs:
           git add geosite.db.sha256sum
           
           git commit -am "Updated at $(date)"
-          git branch -D release
+          
+          # 强制替换 release 分支
+          git branch -D release || true
           git branch -m release
+
       - name: GitHub Push
-        uses: ad-m/github-push-action@v0.6.0
+        if: steps.build.outputs.skip != 'true'
+        uses: ad-m/github-push-action@v0.8.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           branch: release
           force: true
 
       - name: Purge CDN Cache
+        if: steps.build.outputs.skip != 'true'
         run: |
-          curl -L https://purge.jsdelivr.net/gh/soffchen/sing-geosite@release/geosite.db > /dev/null 2>&1
-          curl -L https://purge.jsdelivr.net/gh/soffchen/sing-geosite@release/geosite.db.sha256sum > /dev/null 2>&1
-          
+          # 这里的 URL 用户名 "soffchen" 可能需要根据你实际的 GitHub 用户名修改
+          # 建议使用 ${{ github.repository }} 动态获取
+          curl -L https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db > /dev/null 2>&1
+          curl -L https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db.sha256sum > /dev/null 2>&1
+
       - name: Create a release
         if: steps.build.outputs.skip != 'true'
         id: create_release
@@ -70,6 +101,7 @@ jobs:
           release_name: ${{ steps.build.outputs.tag }}
           draft: false
           prerelease: false
+
       - name: Release geosite.db
         if: steps.build.outputs.skip != 'true'
         uses: actions/upload-release-asset@v1
@@ -80,6 +112,7 @@ jobs:
           asset_path: ./geosite.db
           asset_name: geosite.db
           asset_content_type: application/octet-stream
+
       - name: Release geosite.db sha256sum
         if: steps.build.outputs.skip != 'true'
         uses: actions/upload-release-asset@v1
