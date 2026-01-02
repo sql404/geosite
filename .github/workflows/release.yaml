@@ -6,7 +6,7 @@ on:
     - cron: "30 22 * * *"
 
 permissions:
-  contents: write # 必须：允许 Action 创建 Release 和提交代码
+  contents: write # 必须赋予写权限，否则无法发布 Release 和推送代码
 
 jobs:
   build:
@@ -21,30 +21,49 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
+          # 必须使用 Go 1.20，否则旧版 sing-box 库会报 invalidptr panic
           go-version: '1.20'
+          check-latest: true
 
-      # --- 1. 下载并处理自定义广告规则 ---
+      # --- 核心步骤：准备数据 & 注入规则 ---
       - name: Prepare custom rules
         run: |
-          mkdir -p data
-          echo "Downloading and processing heidai rules..."
-          # 下载 hosts -> 过滤 0.0.0.0 -> 提取域名 -> 存入 data/heidai
+          echo "Step 1: Fetching community rules..."
+          # 1. 克隆 v2fly 社区规则，确保包含 google, cn 等基础规则
+          git clone --depth 1 https://github.com/v2fly/domain-list-community.git temp_rules
+          rm -rf data
+          mv temp_rules/data .
+          rm -rf temp_rules
+
+          echo "Step 2: Processing custom adblock rules..."
+          # 2. 下载你的 hosts 文件，清洗为纯域名格式，保存为 data/heidai
           curl -sL https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockhosts.txt | \
           grep "^0.0.0.0" | \
           awk '{print $2}' > data/heidai
-          echo "Processed rules count: $(wc -l < data/heidai)"
+          
+          # 验证是否下载成功
+          RULE_COUNT=$(wc -l < data/heidai)
+          if [ "$RULE_COUNT" -lt 10 ]; then
+            echo "Error: Downloaded rules are too few ($RULE_COUNT). Check network or source."
+            exit 1
+          fi
+          echo "Downloaded $RULE_COUNT custom rules."
 
-      # --- 2. 编译 geosite ---
+          echo "Step 3: Injecting into category-ads-all..."
+          # 3. 将 heidai 包含进 category-ads-all
+          # 这样使用 geosite:category-ads-all 时就会生效
+          echo "include:heidai" >> data/category-ads-all
+
       - name: Build geosite
         id: build
         run: |
           go run -v .
 
-      # --- 3. 生成 Tag (关键修复：防止 Go 代码没输出 Tag 导致报错) ---
+      # --- Tag 生成器 (防止 Go 代码无输出导致 Release 失败) ---
       - name: Generate Tag
         id: tag_generator
         run: |
-          # 优先使用 build 步骤输出的 tag，如果没有，则使用当前日期
+          # 优先读取 build 步骤的输出，如果没有则使用当前时间
           if [ -n "${{ steps.build.outputs.tag }}" ]; then
             echo "release_tag=${{ steps.build.outputs.tag }}" >> $GITHUB_OUTPUT
           else
@@ -58,7 +77,7 @@ jobs:
           cp geosite.db dist/
           sha256sum geosite.db > dist/geosite.db.sha256sum
 
-      # --- 4. 推送到 release 分支 ---
+      # --- 推送文件到 release 分支 ---
       - name: Push artifacts to release branch
         if: steps.build.outputs.skip != 'true'
         run: |
@@ -66,7 +85,7 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git fetch
           
-          # 切换或创建 release 分支
+          # 切换或新建 release 分支
           git checkout release || git checkout -b release
           git checkout --orphan release-orphan
           git rm -rf .
@@ -77,7 +96,7 @@ jobs:
           
           git commit -am "Updated at $(date)"
           
-          # 强制覆盖 release 分支
+          # 强制覆盖远程分支
           git branch -D release || true
           git branch -m release
 
@@ -89,15 +108,14 @@ jobs:
           branch: release
           force: true
 
-      # --- 5. 刷新 CDN ---
+      # --- 刷新 jsdelivr CDN 缓存 ---
       - name: Purge CDN Cache
         if: steps.build.outputs.skip != 'true'
         run: |
-          # 自动使用当前仓库名，无需手动修改
           curl -L "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db" > /dev/null 2>&1
           curl -L "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db.sha256sum" > /dev/null 2>&1
 
-      # --- 6. 发布 Release (替换了所有报错的旧插件) ---
+      # --- 发布 Release (使用新版插件) ---
       - name: Release and Upload Assets
         if: steps.build.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
