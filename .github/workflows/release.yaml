@@ -5,13 +5,13 @@ on:
   schedule:
     - cron: "30 22 * * *"
 
+permissions:
+  contents: write # 必须：允许 Action 创建 Release 和提交代码
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # 必须赋予写权限，否则无法创建 Release
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,23 +23,33 @@ jobs:
         with:
           go-version: '1.22'
 
-      # --- 自定义规则处理步骤 ---
+      # --- 1. 下载并处理自定义广告规则 ---
       - name: Prepare custom rules
         run: |
           mkdir -p data
           echo "Downloading and processing heidai rules..."
+          # 下载 hosts -> 过滤 0.0.0.0 -> 提取域名 -> 存入 data/heidai
           curl -sL https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockhosts.txt | \
           grep "^0.0.0.0" | \
           awk '{print $2}' > data/heidai
-          echo "Extracted $(wc -l < data/heidai) rules to data/heidai"
+          echo "Processed rules count: $(wc -l < data/heidai)"
 
+      # --- 2. 编译 geosite ---
       - name: Build geosite
         id: build
         run: |
           go run -v .
-          # 注意：你的 Go 代码必须向 $GITHUB_OUTPUT 写入 tag，
-          # 例如：echo "tag=20240101" >> $GITHUB_OUTPUT
-          # 如果你的 go 代码没有输出 tag，下面的 release 步骤可能会因为找不到 tag 而失败。
+
+      # --- 3. 生成 Tag (关键修复：防止 Go 代码没输出 Tag 导致报错) ---
+      - name: Generate Tag
+        id: tag_generator
+        run: |
+          # 优先使用 build 步骤输出的 tag，如果没有，则使用当前日期
+          if [ -n "${{ steps.build.outputs.tag }}" ]; then
+            echo "release_tag=${{ steps.build.outputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "release_tag=$(date +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+          fi
 
       - name: Generate sha256 hash
         if: steps.build.outputs.skip != 'true'
@@ -48,6 +58,7 @@ jobs:
           cp geosite.db dist/
           sha256sum geosite.db > dist/geosite.db.sha256sum
 
+      # --- 4. 推送到 release 分支 ---
       - name: Push artifacts to release branch
         if: steps.build.outputs.skip != 'true'
         run: |
@@ -66,7 +77,7 @@ jobs:
           
           git commit -am "Updated at $(date)"
           
-          # 强制更新 release 分支
+          # 强制覆盖 release 分支
           git branch -D release || true
           git branch -m release
 
@@ -78,23 +89,23 @@ jobs:
           branch: release
           force: true
 
+      # --- 5. 刷新 CDN ---
       - name: Purge CDN Cache
         if: steps.build.outputs.skip != 'true'
         run: |
-          # 自动获取当前仓库名称，格式为 "用户名/仓库名"
-          REPO_NAME="${{ github.repository }}"
-          curl -L "https://purge.jsdelivr.net/gh/${REPO_NAME}@release/geosite.db" > /dev/null 2>&1
-          curl -L "https://purge.jsdelivr.net/gh/${REPO_NAME}@release/geosite.db.sha256sum" > /dev/null 2>&1
+          # 自动使用当前仓库名，无需手动修改
+          curl -L "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db" > /dev/null 2>&1
+          curl -L "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/geosite.db.sha256sum" > /dev/null 2>&1
 
-      # --- 核心修复：使用新的 Action 发布 Release ---
+      # --- 6. 发布 Release (替换了所有报错的旧插件) ---
       - name: Release and Upload Assets
         if: steps.build.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.build.outputs.tag }}
-          name: ${{ steps.build.outputs.tag }}
+          tag_name: ${{ steps.tag_generator.outputs.release_tag }}
+          name: ${{ steps.tag_generator.outputs.release_tag }}
           files: |
-            geosite.db
-            geosite.db.sha256sum
+            dist/geosite.db
+            dist/geosite.db.sha256sum
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
