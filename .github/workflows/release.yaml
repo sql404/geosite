@@ -21,7 +21,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.20'
 
       # --- 1. 下载并处理自定义广告规则 ---
       - name: Prepare custom rules
